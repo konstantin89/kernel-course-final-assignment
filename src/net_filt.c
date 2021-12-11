@@ -15,13 +15,18 @@
 #include <linux/spinlock.h>
 #include <linux/types.h>
 #include <linux/proc_fs.h>
+#include <linux/moduleparam.h>
+
+
+static long cache_ttl_ns = 0;
+module_param(cache_ttl_ns, long, 0755);
+
 
 static spinlock_t g_cache_lock;
 
 #define PROC_FILE_NAME "netfilter_proc_file"
 static struct proc_dir_entry *g_proc_fs_entry;
 
-static long g_cache_entry_ttl_ns = 0;
 static struct list_head g_cache_head;
 
 /////////////////////////////////////////////////////////// #define MAX_CACHE_SIZE 50
@@ -142,7 +147,7 @@ static void pop_oldest_cache_entry(void)
     printk("Cache entry removed. Current count [%d] \n", g_cache_size);
 }
 
-static void add_data_to_cache(char *mac_head, struct iphdr *ip_header, char *net_device_name)
+static void add_data_to_cache(char *mac_head, char *net_device_name)
 {
     struct FilterCacheEntry *entry = NULL;
   
@@ -154,8 +159,6 @@ static void add_data_to_cache(char *mac_head, struct iphdr *ip_header, char *net
     }
 
     memcpy(&mac_head[6],entry->mac_address, MAC_ADDRESS_SIZE);
-    entry->source_ipv4 = (unsigned int)ip_header->saddr;
-    entry->source_ipv4 = 0;
     strcpy(entry->network_device_name, net_device_name); 
     entry->arrival_time_ns = ktime_get_ns();
     
@@ -177,17 +180,15 @@ static unsigned int arp_in_hook (void *priv,
                                  const struct nf_hook_state *state)
 {
     char *mac_head = NULL;
-    struct iphdr *ip_header = NULL; //https://docs.huihoo.com/doxygen/linux/kernel/3.7/structiphdr.html
     char* net_device_name = NULL;
     
     spin_lock(&g_cache_lock);
-    
+
     if(NULL == skb)
     {
         goto exit;
     }
 
-    ip_header = (struct iphdr *)skb_network_header(skb);
     mac_head = skb_mac_header(skb);
 
     if((NULL == skb->dev) || (NULL == skb->dev->name))
@@ -204,13 +205,7 @@ static unsigned int arp_in_hook (void *priv,
       goto exit;
     }
 
-    if((NULL == ip_header))
-    {
-      printk("[X] Error: IPv4 header is NULL \n");
-      goto exit;
-    }
-
-    add_data_to_cache(mac_head, ip_header, net_device_name);
+     add_data_to_cache(mac_head, net_device_name);
 
 exit:
     spin_unlock(&g_cache_lock);
@@ -222,7 +217,7 @@ static int __init net_init(void)
 {
     int err = 0;
 
-    printk("Netfilter module is loading. Cache TTL is [%ld]\n", g_cache_entry_ttl_ns);
+    printk("Netfilter module is loading. Cache TTL is [%ld]\n", cache_ttl_ns);
     
     spin_lock_init(&g_cache_lock);
     INIT_LIST_HEAD(&g_cache_head);
