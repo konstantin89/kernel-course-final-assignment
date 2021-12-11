@@ -24,10 +24,11 @@ static struct proc_dir_entry *g_proc_fs_entry;
 static long g_cache_entry_ttl_ns = 0;
 static struct list_head g_cache_head;
 
-#define MAX_CACHE_SIZE 50
+/////////////////////////////////////////////////////////// #define MAX_CACHE_SIZE 50
+#define MAX_CACHE_SIZE 5
 static int g_cache_size = 0;
 
-#define MAC_ADDRESS_SIZE 8
+#define MAC_ADDRESS_SIZE 6
 #define DEVICE_NAME_MAX_SIZE 16
 
 struct FilterCacheEntry
@@ -64,6 +65,26 @@ static struct nf_hook_ops tr_hook_ops =
 
 
 
+static int print_cache_entry_to_buffer(struct FilterCacheEntry* entry, char* dest_buf, size_t dest_buf_size)
+{
+  int bytes_written = 0;
+
+  if(NULL == entry)
+  {
+    printk("Error: Cache entry is NULL \n");
+  }
+
+  bytes_written = snprintf(dest_buf, dest_buf_size, "MAC: [%02x:%02x:%02x:%02x:%02x:%02x], DEV: [%s]",
+           entry->mac_address[0]&0xff,
+           entry->mac_address[1]&0xff,
+           entry->mac_address[2]&0xff,
+           entry->mac_address[3]&0xff,
+           entry->mac_address[4]&0xff,
+           entry->mac_address[5]&0xff,
+           entry->network_device_name);
+
+  return bytes_written;
+}
 
 static ssize_t proc_write(struct file *file, const char __user *ubuf,size_t count, loff_t *ppos) 
 {
@@ -73,8 +94,36 @@ static ssize_t proc_write(struct file *file, const char __user *ubuf,size_t coun
 
 static ssize_t proc_read(struct file *file, char __user *ubuf,size_t count, loff_t *ppos) 
 {
-	printk("Proc file read handler\n");
-	return 0;
+  ssize_t total_bytes_written = 0;
+  int entry_bytes_written = 0;
+
+  spin_lock(&g_cache_lock);
+
+	printk("Proc file read handler. Bytes count: [%lu]\n", count);
+
+  char temp_buf[256];
+
+
+  struct list_head *pos = NULL;
+  struct FilterCacheEntry *current_entry = NULL;
+
+  list_for_each(pos, &g_cache_head) 
+  {
+    current_entry = list_entry(pos, struct FilterCacheEntry, list);
+    entry_bytes_written = print_cache_entry_to_buffer(current_entry, temp_buf, 256);
+
+    if(count <= (total_bytes_written + entry_bytes_written))
+    {
+      break;
+    }
+
+    //printk("%s \n", temp_buf);
+    copy_to_user(ubuf + total_bytes_written, temp_buf, entry_bytes_written);
+  }
+
+  spin_unlock(&g_cache_lock);
+
+	return total_bytes_written;
 }
 
 static void pop_oldest_cache_entry(void)
@@ -89,9 +138,11 @@ static void pop_oldest_cache_entry(void)
     head = list_first_entry(&g_cache_head, struct FilterCacheEntry, list);
     list_del(&head->list);
     g_cache_size--;
+
+    printk("Cache entry removed. Current count [%d] \n", g_cache_size);
 }
 
-static void add_data_to_cache(char *mac_head, struct iphdr *ip_header)
+static void add_data_to_cache(char *mac_head, struct iphdr *ip_header, char *net_device_name)
 {
     struct FilterCacheEntry *entry = NULL;
   
@@ -103,38 +154,49 @@ static void add_data_to_cache(char *mac_head, struct iphdr *ip_header)
     }
 
     memcpy(&mac_head[6],entry->mac_address, MAC_ADDRESS_SIZE);
-    //entry->source_ipv4 = (unsigned int)ip_header->saddr;
+    entry->source_ipv4 = (unsigned int)ip_header->saddr;
     entry->source_ipv4 = 0;
-    strcpy("temp", entry->network_device_name); ////////////////////// Todo - place dev name here
+    strcpy(entry->network_device_name, net_device_name); 
     entry->arrival_time_ns = ktime_get_ns();
     
     if(g_cache_size >= MAX_CACHE_SIZE)
     {
+      printk("Cache max size of [%d] entries reached \n", MAX_CACHE_SIZE);
       pop_oldest_cache_entry();
     }
 
     INIT_LIST_HEAD(&entry->list);
     list_add_tail(&entry->list, &g_cache_head);
     g_cache_size++;
+
+    printk("Cache entry added. Current count [%d] \n", g_cache_size);
 }
 
 static unsigned int arp_in_hook (void *priv,
                                  struct sk_buff *skb,
                                  const struct nf_hook_state *state)
 {
-
-    spin_lock(&g_cache_lock);
-
     char *mac_head = NULL;
     struct iphdr *ip_header = NULL; //https://docs.huihoo.com/doxygen/linux/kernel/3.7/structiphdr.html
+    char* net_device_name = NULL;
+    
+    spin_lock(&g_cache_lock);
     
     if(NULL == skb)
     {
         goto exit;
     }
 
-    ip_header = NULL; //(struct iphdr *)skb_network_header(skb);
+    ip_header = (struct iphdr *)skb_network_header(skb);
     mac_head = skb_mac_header(skb);
+
+    if((NULL == skb->dev) || (NULL == skb->dev->name))
+    {
+      printk("Error: Network device is NULL \n");
+      goto exit;
+    }
+
+    net_device_name = skb->dev->name;
 
     if((NULL == mac_head))
     {
@@ -148,9 +210,7 @@ static unsigned int arp_in_hook (void *priv,
       goto exit;
     }
 
-    //add_data_to_cache(mac_head, ip_header);
-
-    //printk ("%02x:%02x:%02x:%02x:%02x:%02x\n",mac_head[6]&0xff,mac_head[7]&0xff,mac_head[8]&0xff,mac_head[9]&0xff,mac_head[10]&0xff,mac_head[11]&0xff);
+    add_data_to_cache(mac_head, ip_header, net_device_name);
 
 exit:
     spin_unlock(&g_cache_lock);
@@ -166,6 +226,7 @@ static int __init net_init(void)
     
     spin_lock_init(&g_cache_lock);
     INIT_LIST_HEAD(&g_cache_head);
+
     g_proc_fs_entry = proc_create(PROC_FILE_NAME, 0660, NULL, &proc_file_ops);
     
     if(NULL == g_proc_fs_entry)
@@ -174,7 +235,7 @@ static int __init net_init(void)
       return -1;
     }
 
-    //err = nf_register_net_hook (&init_net, &tr_hook_ops);
+    err = nf_register_net_hook (&init_net, &tr_hook_ops);
     
     return err;
 }
