@@ -21,6 +21,8 @@
 static long cache_ttl_ns = 0;
 module_param(cache_ttl_ns, long, 0755);
 
+#define FORMAT_BUFFER_SIZE 256
+#define PROC_WRITE_BUFFER_SIZE 32
 
 static spinlock_t g_cache_lock;
 
@@ -29,8 +31,7 @@ static struct proc_dir_entry *g_proc_fs_entry;
 
 static struct list_head g_cache_head;
 
-/////////////////////////////////////////////////////////// #define MAX_CACHE_SIZE 50
-#define MAX_CACHE_SIZE 5
+#define MAX_CACHE_SIZE 50
 static int g_cache_size = 0;
 
 #define MAC_ADDRESS_SIZE 6
@@ -79,7 +80,7 @@ static int print_cache_entry_to_buffer(struct FilterCacheEntry* entry, char* des
     printk("Error: Cache entry is NULL \n");
   }
 
-  bytes_written = snprintf(dest_buf, dest_buf_size, "MAC: [%02x:%02x:%02x:%02x:%02x:%02x], DEV: [%s]",
+  bytes_written = snprintf(dest_buf, dest_buf_size, "MAC: [%02x:%02x:%02x:%02x:%02x:%02x], DEV: [%s]\n",
            entry->mac_address[0]&0xff,
            entry->mac_address[1]&0xff,
            entry->mac_address[2]&0xff,
@@ -93,21 +94,49 @@ static int print_cache_entry_to_buffer(struct FilterCacheEntry* entry, char* des
 
 static ssize_t proc_write(struct file *file, const char __user *ubuf,size_t count, loff_t *ppos) 
 {
-	printk("Proc file write handler\n");
-	return -1;
+  int number_of_entries_to_remove = 0;
+  char processed_input[PROC_WRITE_BUFFER_SIZE] = {0};
+  int index = 0;
+
+  spin_lock(&g_cache_lock);
+	printk("Proc file write handler. Data size: [%ld]\n", count);
+/*
+  if(count > PROC_WRITE_BUFFER_SIZE)
+  {
+    printk("Error! Input too long. Length: [%ld], Max allowed: [%d]\n", count, PROC_WRITE_BUFFER_SIZE);
+  }
+
+  if(copy_from_user(processed_input, ubuf, count))
+  {
+    printk("Error! Copy from user failed! \n");
+  }
+
+  for(index=0; index<count; count++)
+  {
+    // Remove all non numeric characters from input.
+    if((processed_input[index] < 48) ||(processed_input[index] > 57) )
+    {
+      processed_input[index] = '\0';
+    }
+  }
+*/
+  //kstrtoint(processed_input, 10, &number_of_entries_to_remove);
+  printk("Removing [%d] cache entries\n", number_of_entries_to_remove);
+
+exit:
+  spin_unlock(&g_cache_lock);
+	return count;
 }
 
 static ssize_t proc_read(struct file *file, char __user *ubuf,size_t count, loff_t *ppos) 
 {
   ssize_t total_bytes_written = 0;
   int entry_bytes_written = 0;
+  char format_buffer[FORMAT_BUFFER_SIZE];
 
   spin_lock(&g_cache_lock);
 
-	printk("Proc file read handler. Bytes count: [%lu]\n", count);
-
-  char temp_buf[256];
-
+	printk("Proc file read handler. Bytes count: [%lu], Current cache size: [%d]\n", count, g_cache_size);
 
   struct list_head *pos = NULL;
   struct FilterCacheEntry *current_entry = NULL;
@@ -115,19 +144,19 @@ static ssize_t proc_read(struct file *file, char __user *ubuf,size_t count, loff
   list_for_each(pos, &g_cache_head) 
   {
     current_entry = list_entry(pos, struct FilterCacheEntry, list);
-    entry_bytes_written = print_cache_entry_to_buffer(current_entry, temp_buf, 256);
+    entry_bytes_written = print_cache_entry_to_buffer(current_entry, format_buffer, FORMAT_BUFFER_SIZE);
 
-    if(count <= (total_bytes_written + entry_bytes_written))
+    if(copy_to_user(ubuf + total_bytes_written, format_buffer, entry_bytes_written))
     {
-      break;
+      return -EFAULT;
     }
 
-    //printk("%s \n", temp_buf);
-    copy_to_user(ubuf + total_bytes_written, temp_buf, entry_bytes_written);
+    total_bytes_written += entry_bytes_written;
   }
 
   spin_unlock(&g_cache_lock);
 
+  *ppos += total_bytes_written;
 	return total_bytes_written;
 }
 
@@ -222,7 +251,7 @@ static int __init net_init(void)
     spin_lock_init(&g_cache_lock);
     INIT_LIST_HEAD(&g_cache_head);
 
-    g_proc_fs_entry = proc_create(PROC_FILE_NAME, 0660, NULL, &proc_file_ops);
+    g_proc_fs_entry = proc_create(PROC_FILE_NAME, 0666, NULL, &proc_file_ops);
     
     if(NULL == g_proc_fs_entry)
     {
