@@ -1,7 +1,7 @@
 /**
 * @file:   net_felt.c
 * @author: Kosta Bulgakov
-* @breif:  Final assignment for Linux kernel course in Allot
+* @brief:  Final assignment for Linux kernel course in Allot
 */
 
 #include <linux/module.h>
@@ -18,8 +18,13 @@
 #include <linux/list.h>
 #include <linux/moduleparam.h>
 #include <linux/delay.h>
+#include <linux/stat.h>
+#include <linux/if.h>
 
-
+/**
+ * @var: cache_ttl_sec
+ * @brief: Module parameter that is represeting the TTL (time to live) for each cache entry.
+ */
 static long cache_ttl_sec = 0;
 module_param(cache_ttl_sec, long, 0755);
 
@@ -37,7 +42,6 @@ static struct list_head g_cache_head;
 static long g_cache_size = 0;
 
 #define MAC_ADDRESS_SIZE 6
-#define DEVICE_NAME_MAX_SIZE 16
 
 #define TIMER_INTERVAL_MS 1000
 static struct timer_list g_cache_timer;
@@ -45,15 +49,28 @@ static struct timer_list g_cache_timer;
 struct FilterCacheEntry
 {
     char mac_address[MAC_ADDRESS_SIZE];
-    unsigned int source_ipv4 ; 
-    char network_device_name[DEVICE_NAME_MAX_SIZE];
+
+    /**
+     * @brief: String containing the network device of the ARP inbound request.
+     *         IFNAMSIZ defined in linux/if.h. Its max device name in netdevice.h.
+     */
+    char network_device_name[IFNAMSIZ];
     
     long arrival_time_secs;
     
     struct list_head list;
 };
   
+/**
+ * @function: proc_write
+ * @brief: Write function of the proc file.
+ */
 static ssize_t proc_write(struct file *file, const char __user *ubuf,size_t count, loff_t *ppos); 
+
+/**
+ * @function: proc_read
+ * @brief: Read function of the proc file.
+ */
 static ssize_t proc_read(struct file *file, char __user *ubuf,size_t count, loff_t *ppos);
 
 /**
@@ -64,18 +81,18 @@ static void pop_oldest_cache_entry(void);
 
 /**
  * @function: pop_n_cache_entries
- * @breif: Remove N oldest entries from cache.
+ * @brief: Remove N oldest entries from cache.
  * @param: cache_entries_to_remove - Number of entries to remove.
  */
 static void pop_n_cache_entries(long cache_entries_to_remove);
 
 /**
- * @function: trim_expired_cache_etries
+ * @function: trim_expired_cache_entries
  * @brief: Remove expired cache entries.
  *         Each cache entry has TTL(time to live) period defined by cache_ttl_sec.
  * @param: cache_ttl - Cache entry expiration time. If set to 0, all cache entries will be removed.
  */
-static void trim_expired_cache_etries(long cache_ttl);
+static void trim_expired_cache_entries(long cache_ttl);
 
 /**
  * @function: cache_timer_callback
@@ -93,14 +110,18 @@ static void cache_timer_callback( struct timer_list *t);
  */
 static int print_cache_entry_to_buffer(struct FilterCacheEntry* entry, char* dest_buf, size_t dest_buf_size);
 
+/**
+ * @function: arp_in_hook
+ * @brief: Netfilter hook function for ARP protocol.
+ */
+static unsigned int arp_in_hook (void *priv, struct sk_buff *skb, const struct nf_hook_state *state);
+
 static struct file_operations proc_file_ops = 
 {
-	.owner = THIS_MODULE,
-	.read = proc_read,
-	.write = proc_write,
+  .owner = THIS_MODULE,
+  .read = proc_read,
+  .write = proc_write,
 };
-
-static unsigned int arp_in_hook (void *priv, struct sk_buff *skb, const struct nf_hook_state *state);
 
 static struct nf_hook_ops tr_hook_ops = 
 {
@@ -110,8 +131,7 @@ static struct nf_hook_ops tr_hook_ops =
     .priority = INT_MIN,
 };
 
-
-static void trim_expired_cache_etries(long cache_ttl)
+static void trim_expired_cache_entries(long cache_ttl)
 {
   long current_time = 0;
   long seconds_since_packet_arrived = 0;
@@ -144,7 +164,7 @@ static void cache_timer_callback( struct timer_list *t)
   spin_lock(&g_cache_lock);
   printk("Timer callback is called \n");
 
-  trim_expired_cache_etries(cache_ttl_sec);
+  trim_expired_cache_entries(cache_ttl_sec);
 
   mod_timer( &g_cache_timer, jiffies + msecs_to_jiffies(TIMER_INTERVAL_MS));
   spin_unlock(&g_cache_lock);
@@ -179,7 +199,7 @@ static ssize_t proc_write(struct file *file, const char __user *ubuf,size_t coun
   int str_to_int_ret_code = 0;
 
   spin_lock(&g_cache_lock);
-	printk("Proc file write handler. Data size: [%ld]\n", count);
+  printk("Proc file write handler. Data size: [%ld]\n", count);
 
   if(count > PROC_WRITE_BUFFER_SIZE)
   {
@@ -206,7 +226,7 @@ static ssize_t proc_write(struct file *file, const char __user *ubuf,size_t coun
 
 exit:
   spin_unlock(&g_cache_lock);
-	return count;
+  return count;
 }
 
 static ssize_t proc_read(struct file *file, char __user *ubuf,size_t count, loff_t *ppos) 
@@ -219,7 +239,15 @@ static ssize_t proc_read(struct file *file, char __user *ubuf,size_t count, loff
 
   spin_lock(&g_cache_lock);
 
-	printk("Proc file read handler. Bytes count: [%lu], Current cache size: [%ld]\n", count, g_cache_size);
+  printk("Proc file read handler. Bytes count: [%lu], Current cache size: [%ld]\n", count, g_cache_size);
+
+  if(*ppos > 0)
+  {
+    // We done writing cache to the proc file. 
+    // Returning zero will let the reader know that there is no more data to read.
+    total_bytes_written = 0;
+    goto exit;
+  }
 
   list_for_each(pos, &g_cache_head) 
   {
@@ -234,10 +262,11 @@ static ssize_t proc_read(struct file *file, char __user *ubuf,size_t count, loff
     total_bytes_written += entry_bytes_written;
   }
 
-  spin_unlock(&g_cache_lock);
-
   *ppos += total_bytes_written;
-	return total_bytes_written;
+
+exit:
+  spin_unlock(&g_cache_lock);
+  return total_bytes_written;
 }
 
 static void pop_oldest_cache_entry(void)
@@ -354,7 +383,7 @@ static int __init net_init(void)
     spin_lock_init(&g_cache_lock);
     INIT_LIST_HEAD(&g_cache_head);
 
-    g_proc_fs_entry = proc_create(PROC_FILE_NAME, 0666, NULL, &proc_file_ops);
+    g_proc_fs_entry = proc_create(PROC_FILE_NAME, S_IALLUGO, NULL, &proc_file_ops);
     
     if(NULL == g_proc_fs_entry)
     {
@@ -380,10 +409,12 @@ static void __exit net_exit (void)
       msleep(100);
     }
 
-    nf_unregister_net_hook (&init_net, &tr_hook_ops);
+    nf_unregister_net_hook(&init_net, &tr_hook_ops);
     proc_remove(g_proc_fs_entry);
 
-    trim_expired_cache_etries(0); //Remove all cache entries
+    // Remove all cache entries.
+    // The param cache_ttl=0 will expire all cache entires and remove them.
+    trim_expired_cache_entries(0);
 
     return;
 }
