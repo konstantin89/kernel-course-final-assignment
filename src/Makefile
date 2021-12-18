@@ -9,7 +9,7 @@ default:
 	$(MAKE) -C $(KDIR) SUBDIRS=$(PWD) M=$(PWD) modules
 
 i:
-	sudo insmod net_filt.ko cache_ttl_ns=1000
+	sudo insmod net_filt.ko cache_ttl_sec=5
 
 r:
 	sudo rmmod net_filt

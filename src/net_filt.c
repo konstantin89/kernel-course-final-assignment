@@ -15,11 +15,13 @@
 #include <linux/spinlock.h>
 #include <linux/types.h>
 #include <linux/proc_fs.h>
+#include <linux/list.h>
 #include <linux/moduleparam.h>
+#include <linux/delay.h>
 
 
-static long cache_ttl_ns = 0;
-module_param(cache_ttl_ns, long, 0755);
+static long cache_ttl_sec = 0;
+module_param(cache_ttl_sec, long, 0755);
 
 #define FORMAT_BUFFER_SIZE 256
 #define PROC_WRITE_BUFFER_SIZE 32
@@ -32,10 +34,13 @@ static struct proc_dir_entry *g_proc_fs_entry;
 static struct list_head g_cache_head;
 
 #define MAX_CACHE_SIZE 50
-static int g_cache_size = 0;
+static long g_cache_size = 0;
 
 #define MAC_ADDRESS_SIZE 6
 #define DEVICE_NAME_MAX_SIZE 16
+
+#define TIMER_INTERVAL_MS 1000
+static struct timer_list g_cache_timer;
 
 struct FilterCacheEntry
 {
@@ -43,13 +48,50 @@ struct FilterCacheEntry
     unsigned int source_ipv4 ; 
     char network_device_name[DEVICE_NAME_MAX_SIZE];
     
-    long arrival_time_ns;
+    long arrival_time_secs;
     
     struct list_head list;
 };
   
 static ssize_t proc_write(struct file *file, const char __user *ubuf,size_t count, loff_t *ppos); 
 static ssize_t proc_read(struct file *file, char __user *ubuf,size_t count, loff_t *ppos);
+
+/**
+ * @function: pop_oldest_cache_entry
+ * @brief: Remove oldest entry from cache.
+ */
+static void pop_oldest_cache_entry(void);
+
+/**
+ * @function: pop_n_cache_entries
+ * @breif: Remove N oldest entries from cache.
+ * @param: cache_entries_to_remove - Number of entries to remove.
+ */
+static void pop_n_cache_entries(long cache_entries_to_remove);
+
+/**
+ * @function: trim_expired_cache_etries
+ * @brief: Remove expired cache entries.
+ *         Each cache entry has TTL(time to live) period defined by cache_ttl_sec.
+ * @param: cache_ttl - Cache entry expiration time. If set to 0, all cache entries will be removed.
+ */
+static void trim_expired_cache_etries(long cache_ttl);
+
+/**
+ * @function: cache_timer_callback
+ * @brief: Timer callback that is called each TIMER_INTERVAL_MS and removed all expired cache entries.
+ */
+static void cache_timer_callback( struct timer_list *t);
+
+/**
+ * @function: print_cache_entry_to_buffer
+ * @brief: Function that used to print cache entry to buffer (in human readable format).
+ * @param: entry - Cache entry to be printed.
+ * @param: dest_buf - Destination buffer.
+ * @param: dest_buf_size - Destination buffer size.
+ * @returns: Number of bytes written to dest_buf. 
+ */
+static int print_cache_entry_to_buffer(struct FilterCacheEntry* entry, char* dest_buf, size_t dest_buf_size);
 
 static struct file_operations proc_file_ops = 
 {
@@ -69,7 +111,44 @@ static struct nf_hook_ops tr_hook_ops =
 };
 
 
+static void trim_expired_cache_etries(long cache_ttl)
+{
+  long current_time = 0;
+  long seconds_since_packet_arrived = 0;
 
+  struct list_head *pos = NULL;
+  struct list_head *temp = NULL;
+  struct FilterCacheEntry *current_entry = NULL;
+
+  current_time = ktime_get_seconds();
+
+  list_for_each_safe(pos, temp, &g_cache_head) 
+  {
+    current_entry = list_entry(pos, struct FilterCacheEntry, list);
+
+    seconds_since_packet_arrived = current_time - current_entry->arrival_time_secs;
+    if(seconds_since_packet_arrived > cache_ttl)
+    {
+      // Cache entry has reached its TTL. Remove it.
+      g_cache_size--;
+      printk("Removing expired cache entry. New cache size [%ld].\n", g_cache_size);
+      list_del(&current_entry->list);
+      kfree(current_entry);
+      current_entry  = NULL;
+    }
+  }
+}
+
+static void cache_timer_callback( struct timer_list *t)
+{
+  spin_lock(&g_cache_lock);
+  printk("Timer callback is called \n");
+
+  trim_expired_cache_etries(cache_ttl_sec);
+
+  mod_timer( &g_cache_timer, jiffies + msecs_to_jiffies(TIMER_INTERVAL_MS));
+  spin_unlock(&g_cache_lock);
+}
 
 static int print_cache_entry_to_buffer(struct FilterCacheEntry* entry, char* dest_buf, size_t dest_buf_size)
 {
@@ -78,6 +157,7 @@ static int print_cache_entry_to_buffer(struct FilterCacheEntry* entry, char* des
   if(NULL == entry)
   {
     printk("Error: Cache entry is NULL \n");
+    return 0;
   }
 
   bytes_written = snprintf(dest_buf, dest_buf_size, "MAC: [%02x:%02x:%02x:%02x:%02x:%02x], DEV: [%s]\n",
@@ -94,34 +174,35 @@ static int print_cache_entry_to_buffer(struct FilterCacheEntry* entry, char* des
 
 static ssize_t proc_write(struct file *file, const char __user *ubuf,size_t count, loff_t *ppos) 
 {
-  int number_of_entries_to_remove = 0;
+  long number_of_entries_to_remove = 0;
   char processed_input[PROC_WRITE_BUFFER_SIZE] = {0};
-  int index = 0;
+  int str_to_int_ret_code = 0;
 
   spin_lock(&g_cache_lock);
 	printk("Proc file write handler. Data size: [%ld]\n", count);
-/*
+
   if(count > PROC_WRITE_BUFFER_SIZE)
   {
     printk("Error! Input too long. Length: [%ld], Max allowed: [%d]\n", count, PROC_WRITE_BUFFER_SIZE);
+    goto exit;
   }
 
   if(copy_from_user(processed_input, ubuf, count))
   {
     printk("Error! Copy from user failed! \n");
+    goto exit;
   }
 
-  for(index=0; index<count; count++)
+  str_to_int_ret_code = kstrtol(processed_input, 10, &number_of_entries_to_remove);
+  if(0 != str_to_int_ret_code)
   {
-    // Remove all non numeric characters from input.
-    if((processed_input[index] < 48) ||(processed_input[index] > 57) )
-    {
-      processed_input[index] = '\0';
-    }
+    printk("Error! kstrtol failed! \n");
+    goto exit;
   }
-*/
-  //kstrtoint(processed_input, 10, &number_of_entries_to_remove);
-  printk("Removing [%d] cache entries\n", number_of_entries_to_remove);
+
+  printk("Removing [%ld] cache entries\n", number_of_entries_to_remove);
+
+  pop_n_cache_entries(number_of_entries_to_remove);
 
 exit:
   spin_unlock(&g_cache_lock);
@@ -133,13 +214,12 @@ static ssize_t proc_read(struct file *file, char __user *ubuf,size_t count, loff
   ssize_t total_bytes_written = 0;
   int entry_bytes_written = 0;
   char format_buffer[FORMAT_BUFFER_SIZE];
+  struct list_head *pos = NULL;
+  struct FilterCacheEntry *current_entry = NULL;
 
   spin_lock(&g_cache_lock);
 
-	printk("Proc file read handler. Bytes count: [%lu], Current cache size: [%d]\n", count, g_cache_size);
-
-  struct list_head *pos = NULL;
-  struct FilterCacheEntry *current_entry = NULL;
+	printk("Proc file read handler. Bytes count: [%lu], Current cache size: [%ld]\n", count, g_cache_size);
 
   list_for_each(pos, &g_cache_head) 
   {
@@ -171,9 +251,32 @@ static void pop_oldest_cache_entry(void)
 
     head = list_first_entry(&g_cache_head, struct FilterCacheEntry, list);
     list_del(&head->list);
+    kfree(head);
+    head  = NULL;
+
     g_cache_size--;
 
-    printk("Cache entry removed. Current count [%d] \n", g_cache_size);
+    printk("Cache entry removed. Current count [%ld] \n", g_cache_size);
+}
+
+static void pop_n_cache_entries(long cache_entries_to_remove)
+{
+  long index = 0;
+
+  if(cache_entries_to_remove > g_cache_size)
+  {
+    printk("Requested removing [%ld] cache entries, while current cache size is [%ld] \n", 
+            cache_entries_to_remove, g_cache_size);
+
+    cache_entries_to_remove = g_cache_size;
+  }
+
+  printk("Removing [%ld] cache entries \n", cache_entries_to_remove);
+
+  for(index=0; index<cache_entries_to_remove; index++)
+  {
+    pop_oldest_cache_entry();
+  }
 }
 
 static void add_data_to_cache(char *mac_head, char *net_device_name)
@@ -189,7 +292,7 @@ static void add_data_to_cache(char *mac_head, char *net_device_name)
 
     memcpy(&mac_head[6],entry->mac_address, MAC_ADDRESS_SIZE);
     strcpy(entry->network_device_name, net_device_name); 
-    entry->arrival_time_ns = ktime_get_ns();
+    entry->arrival_time_secs = ktime_get_seconds();
     
     if(g_cache_size >= MAX_CACHE_SIZE)
     {
@@ -201,7 +304,7 @@ static void add_data_to_cache(char *mac_head, char *net_device_name)
     list_add_tail(&entry->list, &g_cache_head);
     g_cache_size++;
 
-    printk("Cache entry added. Current count [%d] \n", g_cache_size);
+    printk("Cache entry added. Current count [%ld] \n", g_cache_size);
 }
 
 static unsigned int arp_in_hook (void *priv,
@@ -246,7 +349,7 @@ static int __init net_init(void)
 {
     int err = 0;
 
-    printk("Netfilter module is loading. Cache TTL is [%ld]\n", cache_ttl_ns);
+    printk("Netfilter module is loading. Cache TTL is [%ld]\n", cache_ttl_sec);
     
     spin_lock_init(&g_cache_lock);
     INIT_LIST_HEAD(&g_cache_head);
@@ -260,6 +363,9 @@ static int __init net_init(void)
     }
 
     err = nf_register_net_hook (&init_net, &tr_hook_ops);
+
+    timer_setup( &g_cache_timer, cache_timer_callback, 0);
+    mod_timer( &g_cache_timer, jiffies + msecs_to_jiffies(TIMER_INTERVAL_MS));
     
     return err;
 }
@@ -268,8 +374,16 @@ static void __exit net_exit (void)
 {
     printk("Netfilter module is unloading.\n");
 
+    while(0 != del_timer( &g_cache_timer ))
+    {
+      printk("Failed to delete timer. Timer is still in use! Sleep few ms and try again. \n");
+      msleep(100);
+    }
+
     nf_unregister_net_hook (&init_net, &tr_hook_ops);
     proc_remove(g_proc_fs_entry);
+
+    trim_expired_cache_etries(0); //Remove all cache entries
 
     return;
 }
